@@ -1,0 +1,197 @@
+"""Venice AI API provider for LEGIONHERCULES - Privacy-focused inference."""
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Any, Optional
+
+import httpx
+
+from legionhercules.core.message import Message
+from legionhercules.llm.base import LLMProvider, LLMResponse
+from legionhercules.llm.message import ChatMessage
+from legionhercules.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+class VeniceProvider(LLMProvider):
+    """Venice AI API provider - Privacy-focused, uncensored inference.
+    
+    Venice AI offers private, uncensored AI inference with no data retention.
+    Supports various open source models.
+    Get API key from: https://venice.ai/
+    """
+    
+    DEFAULT_BASE_URL = "https://api.venice.ai/api/v1"
+    
+    def __init__(
+        self,
+        model: str = "llama-3.3-70b",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: float = 120.0,
+        venice_parameters: Optional[dict] = None,
+    ):
+        super().__init__(model, base_url or self.DEFAULT_BASE_URL)
+        self.api_key = api_key or os.environ.get("VENICE_API_KEY")
+        self.timeout = timeout
+        self.venice_parameters = venice_parameters or {}
+        self._client: Optional[httpx.AsyncClient] = None
+    
+    async def initialize(self) -> None:
+        """Initialize the Venice AI provider."""
+        if not self.api_key:
+            raise ValueError("Venice API key required. Set VENICE_API_KEY environment variable.")
+        
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=self.timeout,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+        
+        logger.info(f"Venice AI provider initialized (model: {self.model})")
+        self._initialized = True
+    
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: Optional[list] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        """Send chat messages to Venice AI."""
+        if not self._client:
+            await self.initialize()
+        
+        venice_messages = []
+        for msg in messages:
+            chat_msg = ChatMessage.from_message(msg)
+            venice_messages.append(chat_msg.to_openai_dict())
+        
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": venice_messages,
+            "temperature": temperature,
+        }
+        
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        
+        if tools:
+            payload["tools"] = [self._convert_tool_schema(t) for t in tools]
+            payload["tool_choice"] = "auto"
+        
+        # Add Venice-specific parameters for privacy/features
+        if self.venice_parameters:
+            payload["venice_parameters"] = self.venice_parameters
+        
+        try:
+            response = await self._client.post("/chat/completions", json=payload)
+            response.raise_for_status()
+            
+            data = response.json()
+            choice = data["choices"][0]
+            message = choice["message"]
+            
+            content = message.get("content", "")
+            tool_calls = None
+            
+            if "tool_calls" in message:
+                tool_calls = self._parse_tool_calls(message["tool_calls"])
+            
+            return LLMResponse(
+                content=content,
+                tool_calls=tool_calls,
+                metadata={
+                    "model": data.get("model"),
+                    "finish_reason": choice.get("finish_reason"),
+                    "venice_params": self.venice_parameters,
+                },
+                usage=data.get("usage"),
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in Venice AI chat: {e}")
+            return LLMResponse(content=f"Error: {str(e)}", metadata={"error": str(e)})
+    
+    async def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+    ) -> LLMResponse:
+        """Generate text from prompt."""
+        messages = [Message.user(prompt)]
+        return await self.chat(messages, temperature=temperature, max_tokens=max_tokens)
+    
+    async def list_models(self) -> list[str]:
+        """List available Venice AI models."""
+        if not self._client:
+            await self.initialize()
+        
+        try:
+            response = await self._client.get("/models")
+            response.raise_for_status()
+            data = response.json()
+            return [m["id"] for m in data.get("data", [])]
+        except Exception as e:
+            logger.error(f"Error listing models: {e}")
+            return [
+                "llama-3.3-70b",
+                "llama-3.1-405b",
+                "llama-3.1-70b",
+                "llama-3.1-8b",
+                "qwen-2.5-coder-32b",
+                "dolphin-2.9.2-qwen2-72b",
+                "deepseek-coder-v2-lite",
+            ]
+    
+    async def health_check(self) -> bool:
+        """Check if Venice AI API is accessible."""
+        if not self._client:
+            try:
+                await self.initialize()
+            except Exception:
+                return False
+        try:
+            response = await self._client.get("/models")
+            return response.status_code == 200
+        except Exception:
+            return False
+    
+    def _convert_tool_schema(self, tool: Any) -> dict[str, Any]:
+        """Convert tool to Venice AI format (OpenAI compatible)."""
+        tool_dict = tool.to_dict() if hasattr(tool, 'to_dict') else tool
+        return {
+            "type": "function",
+            "function": {
+                "name": tool_dict.get("name", ""),
+                "description": tool_dict.get("description", ""),
+                "parameters": tool_dict.get("parameters", {}),
+            }
+        }
+    
+    def _parse_tool_calls(self, tool_calls_data: list[dict]) -> list[dict[str, Any]]:
+        """Parse tool calls from Venice AI response."""
+        parsed = []
+        for tc in tool_calls_data:
+            if tc.get("type") == "function":
+                func = tc.get("function", {})
+                try:
+                    arguments = json.loads(func.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    arguments = {}
+                parsed.append({"name": func.get("name", ""), "arguments": arguments})
+        return parsed
+    
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
